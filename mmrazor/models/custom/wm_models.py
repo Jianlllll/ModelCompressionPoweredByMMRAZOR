@@ -176,6 +176,219 @@ class StudentHRNetW18(_BaseHRNetWrapper):
 
 
 @MODELS.register_module()
+class StudentHRNetW18WithSDecoderLoss(StudentHRNetW18):
+    """Student wrapper with SDecoder-based payload supervision.
+
+    This class decodes the student's segmentation logits together with the
+    input image using WMdemo's SDecoder to predict a 100-bit payload and
+    computes a BCE loss against ground-truth bits loaded by the model.
+
+    Args:
+        num_classes (int): Number of output channels for the student (default 1).
+        norm_eval (bool): Freeze BN running stats during train.
+        data_preprocessor: Inherited.
+        payload_json (str): Path to labels.json mapping fileName -> 100-bit string.
+        sdecoder_trainable (bool): Whether to train SDecoder. Default False (frozen).
+        image_size (tuple[int,int]): Expected (H,W) for SDecoder. Default (400,400).
+        message_length (int): Payload length. Default 100.
+    """
+
+    def __init__(self,
+                 num_classes: int = 1,
+                 norm_eval: bool = True,
+                 data_preprocessor: Optional[Any] = None,
+                 payload_json: Optional[str] = None,
+                 sdecoder_trainable: bool = False,
+                 image_size: tuple[int, int] = (400, 400),
+                 message_length: int = 100,
+                 sdecoder_ckpt: Optional[str] = None,
+                 *args: Any, **kwargs: Any) -> None:
+        super().__init__(num_classes=num_classes,
+                         norm_eval=norm_eval,
+                         data_preprocessor=data_preprocessor)
+
+        # Resolve project root to import WMdemo.model_maotai
+        try:
+            import sys, os
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+            wmdemo_dir = os.path.join(project_root, 'WMdemo')
+            if wmdemo_dir not in sys.path:
+                sys.path.insert(0, wmdemo_dir)
+            from model_maotai import Decoder_Diffusion  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(f'Failed to import WMdemo.model_maotai.Decoder_Diffusion: {e}')
+
+        # Build SDecoder
+        H, W = int(image_size[0]), int(image_size[1])
+        self.sdecoder = Decoder_Diffusion(H, W, message_length)
+        # Load weights if provided
+        if sdecoder_ckpt is not None:
+            import torch
+            import os
+            ckpt_path = os.path.abspath(sdecoder_ckpt)
+            state = torch.load(ckpt_path, map_location='cpu')
+            if isinstance(state, dict) and 'model_state_dict' in state:
+                state = state['model_state_dict']
+            self.sdecoder.load_state_dict(state, strict=False)
+        if not sdecoder_trainable:
+            for p in self.sdecoder.parameters():
+                p.requires_grad_(False)
+        self._sdecoder_trainable = bool(sdecoder_trainable)
+        self._expected_size_hw = (H, W)
+        self._payload_len = int(message_length)
+
+        # Load payload mapping if provided; fallback to on-the-fly missing -> error
+        import json
+        self._name_to_bits: Optional[dict[str, list[int]]] = None
+        if payload_json is not None:
+            payload_path = os.path.abspath(payload_json)
+            with open(payload_path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            # Normalize to basename -> list[int]
+            self._name_to_bits = {}
+            for k, v in raw.items():
+                name = os.path.basename(k)
+                if isinstance(v, str):
+                    bits = [1 if ch == '1' else 0 for ch in v.strip()]
+                else:
+                    bits = [int(x) for x in v]
+                self._name_to_bits[name] = bits
+
+    def _get_payload_from_samples(self, data_samples: Optional[List[BaseDataElement]]) -> torch.Tensor:
+        if data_samples is None or len(data_samples) == 0:
+            raise RuntimeError('data_samples are required to fetch gt_payload')
+        # Prefer payload from mapping using filename to avoid pipeline coupling
+        if self._name_to_bits is None:
+            # Try to read directly from data_samples if provided by pipeline
+            bits_list = []
+            for ds in data_samples:
+                payload = getattr(ds, 'gt_payload', None)
+                if payload is None:
+                    # Try metainfo key
+                    meta = getattr(ds, 'metainfo', {})
+                    payload = meta.get('gt_payload', None) if isinstance(meta, dict) else None
+                if payload is None:
+                    raise RuntimeError('gt_payload is not found in data_samples and no payload_json provided')
+                bits = torch.as_tensor(payload, dtype=torch.float32)
+                bits_list.append(bits)
+            return torch.stack(bits_list, dim=0)
+
+        # Use mapping by filename
+        bits_list: list[torch.Tensor] = []
+        import os
+        for ds in data_samples:  # type: ignore[assignment]
+            meta = getattr(ds, 'metainfo', {})
+            filename = None
+            if isinstance(meta, dict):
+                filename = meta.get('ori_filename', None) or meta.get('filename', None)
+            if not filename:
+                # Fallback attribute
+                filename = getattr(ds, 'img_path', None)
+            if not filename:
+                raise RuntimeError('Cannot resolve filename from data_samples for payload lookup')
+            name = os.path.basename(str(filename))
+            bits = self._name_to_bits.get(name)
+            if bits is None:
+                raise KeyError(f'Payload for image {name} not found in mapping')
+            bits_tensor = torch.tensor(bits, dtype=torch.float32)
+            bits_list.append(bits_tensor)
+        return torch.stack(bits_list, dim=0)
+
+    def loss(self, inputs: torch.Tensor,
+             data_samples: Optional[List[BaseDataElement]] = None):
+        import math
+        import torch.nn.functional as F
+        # Helper: rotate tensor batch by angle (degrees) around center, differentiable
+        def rotate_tensor(img: torch.Tensor, angle_deg: float) -> torch.Tensor:
+            # img: [N,C,H,W]
+            n, c, h, w = img.shape
+            theta = img.new_zeros((n, 2, 3))
+            rad = math.radians(angle_deg)
+            cos, sin = math.cos(rad), math.sin(rad)
+            theta[:, 0, 0] = cos
+            theta[:, 0, 1] = -sin
+            theta[:, 1, 0] = sin
+            theta[:, 1, 1] = cos
+            grid = F.affine_grid(theta, size=img.size(), align_corners=False)
+            return F.grid_sample(img, grid, mode='bilinear', padding_mode='border', align_corners=False)
+
+        # Ensure expected SDecoder size
+        H, W = self._expected_size_hw
+        image = inputs
+        if image.shape[-2:] != (H, W):
+            image = F.interpolate(image, size=(H, W), mode='bilinear', align_corners=False)
+
+        # Import utils for ROI crop (kept identical to eval)
+        try:
+            import sys, os
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+            wmdemo_dir = os.path.join(project_root, 'WMdemo')
+            if wmdemo_dir not in sys.path:
+                sys.path.insert(0, wmdemo_dir)
+            import utils as wmd_utils  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f'Failed to import WMdemo.utils: {e}')
+
+        # Per-angle decode with student's own mask (use raw logits for ROI thresholding)
+        angles = [0.0, 3.0, -3.0]
+        per_angle_probs: list[torch.Tensor] = []
+        per_angle_bces: list[torch.Tensor] = []
+
+        # Ground-truth bits
+        gt_bits = self._get_payload_from_samples(data_samples).to(image.device)
+        if gt_bits.dim() == 1:
+            gt_bits = gt_bits.unsqueeze(0)
+
+        for ang in angles:
+            # Rotate input image
+            img_rot = rotate_tensor(image, ang)
+            # Forward student to get mask logits at this angle
+            s_logit = self.backbone(img_rot)
+            if s_logit.shape[-2:] != (H, W):
+                s_logit = F.interpolate(s_logit, size=(H, W), mode='bilinear', align_corners=False)
+            # ROI crop with raw logits (no sigmoid/no binarize)
+            try:
+                mask_crop, img_crop = wmd_utils.crop_mask_and_image(s_logit, img_rot)
+            except Exception:
+                mask_crop, img_crop = s_logit, img_rot
+            # Decode probabilities via SDecoder
+            y_prob = self.sdecoder(img_crop, mask_crop)
+            # Ensure shape [N, payload_len]
+            if y_prob.dim() == 1:
+                y_prob = y_prob.unsqueeze(0)
+            per_angle_probs.append(y_prob)
+            # BCE to GT
+            bce = F.binary_cross_entropy(y_prob, gt_bits, reduction='none')
+            # reduce over bits, keep batch
+            bce = bce.mean(dim=1)  # [N]
+            per_angle_bces.append(bce)
+
+        # Stack angles: probs[K][N,L] -> [K,N,L], bces[K][N] -> [K,N]
+        probs_stack = torch.stack(per_angle_probs, dim=0)
+        bces_stack = torch.stack(per_angle_bces, dim=0)
+        # Select best angle per sample by min BCE
+        best_idx = torch.argmin(bces_stack, dim=0)  # [N]
+        # Gather best probs per sample
+        K, N, L = probs_stack.shape[0], probs_stack.shape[1], probs_stack.shape[2]
+        idx_expanded = best_idx.view(1, N, 1).expand(1, N, L)
+        best_probs = probs_stack.gather(dim=0, index=idx_expanded).squeeze(0)  # [N,L]
+        # Loss = mean BCE of best angle, weight 0.5
+        loss_decode = F.binary_cross_entropy(best_probs, gt_bits, reduction='mean') * 0.5
+
+        with torch.no_grad():
+            acc_bits = (torch.round(best_probs) == gt_bits).float().mean()
+
+        # Ensure distiller recorders see features from the official (padded) inputs
+        # to avoid size mismatch with teacher features during L2 distillation.
+        try:
+            with torch.no_grad():
+                _ = self.backbone(inputs)
+        except Exception:
+            pass
+
+        return dict(loss_decode=loss_decode, acc_bits=acc_bits)
+
+@MODELS.register_module()
 class StudentPIDNet(_BaseHRNetWrapper):
     """PIDNet student wrapper.
 

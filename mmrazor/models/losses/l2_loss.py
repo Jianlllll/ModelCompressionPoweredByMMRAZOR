@@ -51,6 +51,13 @@ class L2Loss(nn.Module):
             s_feature = self.normalize_feature(s_feature)
             t_feature = self.normalize_feature(t_feature)
 
+        # Spatial align if needed to avoid size mismatch (e.g., 100 vs 104)
+        if s_feature.dim() == 4 and t_feature.dim() == 4 and s_feature.shape[-2:] != t_feature.shape[-2:]:
+            # Resize student to teacher spatial size
+            s_feature = torch.nn.functional.interpolate(
+                s_feature, size=t_feature.shape[-2:], mode='bilinear', align_corners=False
+            )
+
         loss = torch.sum(torch.pow(torch.sub(s_feature, t_feature), 2))
 
         # Calculate l2_loss as dist.

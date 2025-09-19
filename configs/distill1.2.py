@@ -12,8 +12,9 @@ custom_imports = dict(
         'mmseg.engine',
         'mmseg.evaluation',
     'mmseg.visualization',
-    # 注册我们新增的标签二值化变换
-    'mmrazor.datasets.transforms'
+    # 注册我们新增的标签二值化变换与hook
+    'mmrazor.datasets.transforms',
+    'mmrazor.engine.hooks'
     ],
     allow_failed_imports=False
 )
@@ -23,6 +24,18 @@ log_processor = dict(by_epoch=True)
 
 # 教师网络预训练权重路径（使用已对齐为 backbone.* 的权重）
 teacher_ckpt = 'mmrazor/models/Mdecoder_210000.backbone.pth'
+
+# 数据与标签路径（相对当前工程启动目录 mmrazor）
+DATA_ROOT = '../WMdemo/workdir/test'
+TRAIN_IMG_DIR = 'train/img'
+VAL_IMG_DIR = 'val/img'
+TRAIN_PAYLOAD_JSON = DATA_ROOT + '/train/labels.json'
+VAL_PAYLOAD_JSON = DATA_ROOT + '/val/labels.json'
+SDECODER_CKPT = '../WMdemo/models/Sdecoder_210000.pth'
+MDECODER_CKPT = '../WMdemo/models/Mdecoder_210000.pth'
+
+# 调试开关：学生评测链路是否使用教师掩码
+STUDENT_USE_TEACHER_MASK = False
 
 # 使用自定义已注册的教师/学生模型；你的任务为二值/单通道(num_classes=1)
 model = dict(
@@ -38,12 +51,21 @@ model = dict(
     seg_pad_val=255,
     size_divisor=32,
     ),
-    # 学生与教师均为单通道头（num_classes=1），与现有权重保持一致
-    architecture=dict(type='StudentHRNetW18', num_classes=1, norm_eval=True),
+    # 学生使用带SDecoder监督的封装
+    architecture=dict(
+        type='StudentHRNetW18WithSDecoderLoss',
+        num_classes=1,
+        norm_eval=True,
+        payload_json=TRAIN_PAYLOAD_JSON,  # 训练阶段读取 train/labels.json
+        sdecoder_trainable=False,
+        sdecoder_ckpt=SDECODER_CKPT,
+        image_size=(400, 400),
+        message_length=100
+    ),
     teacher=dict(type='TeacherHRNetW48', num_classes=1),
     teacher_ckpt=teacher_ckpt,
-    # 先关闭学生的GT监督，专注蒸馏信号；后续可再开启
-    calculate_student_loss=False,
+    # 开启学生损失（用于SDecoder BCE）
+    calculate_student_loss=True,
     teacher_trainable=False,
     teacher_norm_eval=True,
     student_trainable=True,
@@ -58,7 +80,7 @@ model = dict(
             out=dict(type='ModuleOutputs', source='backbone.last_layer.3')
         ),
         distill_losses=dict(
-            loss_l2=dict(type='L2Loss', loss_weight=0.1, normalize=False, div_element=True)
+            loss_l2=dict(type='L2Loss', loss_weight=0.5, normalize=False, div_element=True)
         ),
         loss_forward_mappings=dict(
             loss_l2=dict(
@@ -69,27 +91,28 @@ model = dict(
     )
 )
 
-# 暂停验证：待模型 predict 返回分割结果后再启用评测
-val_cfg = dict(type='mmrazor.SingleTeacherDistillValLoop')
-val_evaluator = dict(type='mmseg.IoUMetric', iou_metrics=['mIoU'])
+# 验证开启
+val_cfg = dict(type='ValLoop')
+val_evaluator = []
 find_unused_parameters = True
 
-# 训练循环：显式设置为 x个 epoch；暂不进行验证
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=5, val_interval=1)
+# 训练循环：显式设置为 x个 epoch；每个 epoch 做一次 eval
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=3, val_interval=1)
 
-# Checkpoint 保存：每 20 个 epoch 保存一次；保留最后一个
+# Checkpoint 保存：以 student_bit_acc 作为最优
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=20, save_last=True, save_best='mIoU', rule='greater')
+    checkpoint=dict(type='CheckpointHook', interval=1, save_last=True, save_best='student_bit_acc', rule='greater')
 )
 
-# 早停策略：连续 15 次验证（val_interval=1 即 15 个 epoch）mIoU 无提升则停止
+# 评测 Hook：计算学生/教师 bit-acc
 custom_hooks = [
     dict(
-        type='EarlyStoppingHook',
-        monitor='mIoU',   # 与 save_best 使用同一指标
-        patience=15,
-        rule='greater',
-        min_delta=0.0
+        type='BitAccEvalHook',
+        payload_json=VAL_PAYLOAD_JSON,
+        image_size=(400, 400),
+        mdecoder_ckpt=MDECODER_CKPT,
+        train_payload_json=TRAIN_PAYLOAD_JSON,
+        student_use_teacher_mask=STUDENT_USE_TEACHER_MASK  # A/B 测试：学生端使用教师掩码
     )
 ]
 
@@ -100,59 +123,63 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=1.0, norm_type=2)
 )
 
-# 使用你提供的数据集（单通道掩码，文件名后缀为 _mask.png）
-data_root = 'tests/data/dataset2'
+# 余弦学习率调度（按 epoch）
+param_scheduler = [
+    dict(type='CosineAnnealingLR', T_max=5, by_epoch=True)
+]
 
 metainfo = dict(
     classes=('background', 'foreground'),
     palette=[[0, 0, 0], [255, 255, 255]]
 )
 
+# 训练使用 train/labels.json
 train_pipeline = [
     dict(type='LoadImageFromFile'),
-    dict(type='LoadAnnotations'),
-    dict(type='mmrazor.CenterFitResize', size=(400, 400)),
-    # 将非零像素视为前景，零为背景
-    dict(type='mmrazor.BinarizeSegLabel', mode='nonzero', to_dtype='uint8', invert=False),
+    dict(type='mmrazor.LoadPayloadFromJSON', json_path=TRAIN_PAYLOAD_JSON),
     dict(type='PackSegInputs')
 ]
 
-test_pipeline = [
+# 验证使用 val/labels.json
+val_pipeline = [
     dict(type='LoadImageFromFile'),
-    dict(type='LoadAnnotations'),
-    dict(type='mmrazor.CenterFitResize', size=(400, 400)),
-    dict(type='mmrazor.BinarizeSegLabel', mode='nonzero', to_dtype='uint8', invert=False),
+    dict(type='mmrazor.LoadPayloadFromJSON', json_path=VAL_PAYLOAD_JSON),
     dict(type='PackSegInputs')
 ]
 
 train_dataloader = dict(
-    batch_size=2,
-    num_workers=6,
+    batch_size=1,
+    num_workers=1,
     dataset=dict(
         type='BaseSegDataset',
-        data_root=data_root,
-        data_prefix=dict(img_path='img_dir/train', seg_map_path='ann_dir/train'),
-    img_suffix='.png',
-    seg_map_suffix='_mask.png',
-    pipeline=train_pipeline,
-    metainfo=metainfo),
+        data_root=DATA_ROOT,
+        data_prefix=dict(img_path=TRAIN_IMG_DIR),
+        img_suffix='.png',
+        pipeline=train_pipeline,
+        metainfo=metainfo),
     sampler=dict(type='DefaultSampler', shuffle=True),
-    persistent_workers=True
+    persistent_workers=False
 )
 
 val_dataloader = dict(
-    batch_size=2,
+    batch_size=1,
     num_workers=0,
     dataset=dict(
         type='BaseSegDataset',
-        data_root=data_root,
-        data_prefix=dict(img_path='img_dir/val', seg_map_path='ann_dir/val'),
+        data_root=DATA_ROOT,
+        data_prefix=dict(img_path=VAL_IMG_DIR),
         img_suffix='.png',
-        seg_map_suffix='_mask.png',
-    pipeline=test_pipeline,
-    metainfo=metainfo),
+        pipeline=val_pipeline,
+        metainfo=metainfo),
     sampler=dict(type='DefaultSampler', shuffle=False),
-    persistent_workers=True
+    persistent_workers=False
 )
 
 test_dataloader = None
+
+# 覆盖默认 env_cfg：Windows 下使用 spawn
+env_cfg = dict(
+    cudnn_benchmark=True,
+    mp_cfg=dict(mp_start_method='spawn', opencv_num_threads=0),
+    dist_cfg=dict(backend='nccl')
+)
