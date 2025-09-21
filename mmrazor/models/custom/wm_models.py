@@ -373,7 +373,7 @@ class StudentHRNetW18WithSDecoderLoss(StudentHRNetW18):
         idx_expanded = best_idx.view(1, N, 1).expand(1, N, L)
         best_probs = probs_stack.gather(dim=0, index=idx_expanded).squeeze(0)  # [N,L]
         # Loss = mean BCE of best angle, weight 0.5
-        loss_decode = F.binary_cross_entropy(best_probs, gt_bits, reduction='mean') * 0.5
+        loss_decode = F.binary_cross_entropy(best_probs, gt_bits, reduction='mean') * 6
 
         with torch.no_grad():
             acc_bits = (torch.round(best_probs) == gt_bits).float().mean()

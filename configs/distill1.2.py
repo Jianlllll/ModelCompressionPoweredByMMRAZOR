@@ -80,7 +80,7 @@ model = dict(
             out=dict(type='ModuleOutputs', source='backbone.last_layer.3')
         ),
         distill_losses=dict(
-            loss_l2=dict(type='L2Loss', loss_weight=0.5, normalize=False, div_element=True)
+            loss_l2=dict(type='L2Loss', loss_weight=0.02, normalize=False, div_element=True)
         ),
         loss_forward_mappings=dict(
             loss_l2=dict(
@@ -99,9 +99,26 @@ find_unused_parameters = True
 # 训练循环：显式设置为 x个 epoch；每个 epoch 做一次 eval
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=3, val_interval=1)
 
+
 # Checkpoint 保存：以 student_bit_acc 作为最优
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=1, save_last=True, save_best='student_bit_acc', rule='greater')
+    #checkpoint=dict(type='CheckpointHook', interval=1, save_last=True, save_best='student_bit_acc', rule='greater')
+
+    checkpoint=dict(
+        type='CheckpointHook', 
+        interval=10, 
+        save_last=True, 
+        save_best='student_bit_acc', 
+        rule='greater'
+    ),
+    
+    early_stopping=dict(
+        type='EarlyStoppingHook',
+        monitor='student_bit_acc',  # The metric to monitor
+        patience=10,               # Number of epochs to wait for improvement
+        rule='greater'            # 'greater' means we want the metric to increase
+    )
+
 )
 
 # 评测 Hook：计算学生/教师 bit-acc
@@ -112,14 +129,16 @@ custom_hooks = [
         image_size=(400, 400),
         mdecoder_ckpt=MDECODER_CKPT,
         train_payload_json=TRAIN_PAYLOAD_JSON,
-        student_use_teacher_mask=STUDENT_USE_TEACHER_MASK  # A/B 测试：学生端使用教师掩码
+        student_use_teacher_mask=STUDENT_USE_TEACHER_MASK,  # A/B 测试：学生端使用教师掩码
+        # 确保在 CheckpointHook/EarlyStopping 之前写入 MessageHub 标量
+        priority='VERY_HIGH'
     )
 ]
 
 # 优化器：降低初始学习率并启用梯度裁剪，避免小 batch 训练中数值爆炸
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='SGD', lr=1e-3, momentum=0.9, weight_decay=1e-4),
+    optimizer=dict(type='SGD', lr=3e-4, momentum=0.9, weight_decay=1e-4),
     clip_grad=dict(max_norm=1.0, norm_type=2)
 )
 

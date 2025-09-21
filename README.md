@@ -8,7 +8,9 @@
 conda create --name openmmlab python=3.10 -y
 conda activate openmmlab
 
-conda install pytorch torchvision -c pytorch
+
+conda install pytorch=1.13.1 torchvision=0.14.1 pytorch-cuda=11.6 -c pytorch -c nvidia
+(or pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 --extra-index-url https://download.pytorch.org/whl/cu116)
 ```
 
 
@@ -17,6 +19,7 @@ conda install pytorch torchvision -c pytorch
 
 ```
 cd mmrazor
+pip install -U openmim
 python -m pip install -U joblib
 mim install "mmengine>=0.7.0,<1.0.0"
 mim install "mmcv==2.0.1"
@@ -26,6 +29,11 @@ python -m pip install -i https://pypi.org/simple "mmcls==1.0.0rc6"
 mim install mmsegmentation
 pip install ftfy
 pip install -v -e
+pip install psutil
+pip install kornia
+pip install "opencv-python<4.10"
+pip install "numpy==1.25.0"
+pip install regex
 ```
 
 
@@ -50,7 +58,7 @@ pip install -v -e
 蒸馏：
 
 ```
-python tools/train.py configs/distill1.py
+python tools/train.py configs/distillx.py
 ```
 
 
@@ -83,13 +91,14 @@ python tools/train.py configs/distill1.py
 
 
 
-| 文件、位置                  | 作用                  | 蒸馏方式            | 其他说明                       |
-| --------------------------- | --------------------- | ------------------- | ------------------------------ |
-| mmrazor\configs\distill1.py | HRNet-W18模型训练     | result distillation | 现有参数非训练时所用，仅作测试 |
-| mmrazor\configs\distill2.py | HRNet-W18模型**微调** | 同上                |                                |
-| mmrazor\configs\distill4.py | PIDNet-M模型训练      | 同上                |                                |
+| 文件、位置                   | 作用                  | 蒸馏方式            | 其他说明                       |
+| ---------------------------- | --------------------- | ------------------- | ------------------------------ |
+| mmrazor\configs\distill1.py  | HRNet-W18模型训练     | result distillation | 现有参数非训练时所用，仅作测试 |
+| mmrazor\configs\distill2.py  | HRNet-W18模型**微调** | 同上                |                                |
+| mmrazor\configs\distill4.py  | PIDNet-M模型训练      | 同上                |                                |
+| mmrazor\configs\distill1.2py | HRNet-W18模型训练     | 解码损失+蒸馏损失   |                                |
 
-准备使用argparse指令集成这几个核心蒸馏文件
+
 
 
 
@@ -132,6 +141,7 @@ keys Match版本:mmrazor\mmrazor\models\Mdecoder_210000.backbone.pth
 | mmrazor\tests\data\dataset2         | 五百张无水印          | 调试用   |
 | mmrazor\tests\data\dataset3_3k      | 3千张无水印           |          |
 | mmrazor\tests\data\dataset4RemoveBG | 3千张带水印（无背景） |          |
+| mmrazor\tests\data\xx               | 3千张带随机水印       |          |
 
 
 

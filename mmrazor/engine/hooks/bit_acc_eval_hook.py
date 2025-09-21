@@ -434,9 +434,18 @@ class BitAccEvalHook(Hook):
                 # Option B: do not save teacher masks; only JSON is produced at last epoch
 
         if total_bits > 0:
-            runner.message_hub.update_scalar('student_bit_acc', correct_s / total_bits)
-            runner.message_hub.update_scalar('teacher_bit_acc', correct_t / total_bits)
-            runner.logger.info(f"[ValEval] student_bit_acc={correct_s/total_bits:.4f} teacher_bit_acc={correct_t/total_bits:.4f}")
+            student_acc = correct_s / total_bits
+            teacher_acc = correct_t / total_bits
+            runner.message_hub.update_scalar('student_bit_acc', student_acc)
+            runner.message_hub.update_scalar('teacher_bit_acc', teacher_acc)
+            runner.logger.info(f"[ValEval] student_bit_acc={student_acc:.4f} teacher_bit_acc={teacher_acc:.4f}")
+            # Inject metrics so CheckpointHook/EarlyStoppingHook can see them
+            try:
+                if isinstance(metrics, dict):
+                    metrics['student_bit_acc'] = float(student_acc)
+                    metrics['teacher_bit_acc'] = float(teacher_acc)
+            except Exception:
+                pass
 
         if is_last_epoch and not getattr(self, '_json_written', False):
             try:
