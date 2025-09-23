@@ -93,7 +93,9 @@ model = dict(
 
 # 验证开启
 val_cfg = dict(type='ValLoop')
-val_evaluator = []
+val_evaluator = dict(type='Evaluator', metrics=[
+    dict(type='BitAccMetric', image_size=(400, 400), mdecoder_ckpt=MDECODER_CKPT)
+])
 find_unused_parameters = True
 
 # 训练循环：显式设置为 x个 epoch；每个 epoch 做一次 eval
@@ -115,7 +117,7 @@ default_hooks = dict(
     early_stopping=dict(
         type='EarlyStoppingHook',
         monitor='student_bit_acc',  # The metric to monitor
-        patience=10,               # Number of epochs to wait for improvement
+        patience=15,               # Number of epochs to wait for improvement
         rule='greater'            # 'greater' means we want the metric to increase
     )
 
@@ -135,16 +137,17 @@ custom_hooks = [
     )
 ]
 
-# 优化器：降低初始学习率并启用梯度裁剪，避免小 batch 训练中数值爆炸
+# 优化器：切换为 AdamW 并加入 5 个 epoch 的线性 warmup
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='SGD', lr=3e-4, momentum=0.9, weight_decay=1e-4),
+    optimizer=dict(type='AdamW', lr=1e-4, weight_decay=1e-4),
     clip_grad=dict(max_norm=1.0, norm_type=2)
 )
 
-# 余弦学习率调度（按 epoch）
+# 线性 warmup + 余弦退火（按 epoch）
 param_scheduler = [
-    dict(type='CosineAnnealingLR', T_max=5, by_epoch=True)
+    dict(type='LinearLR', start_factor=0.1, by_epoch=True, begin=0, end=5),
+    dict(type='CosineAnnealingLR', T_max=5, by_epoch=True, begin=5)
 ]
 
 metainfo = dict(
