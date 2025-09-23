@@ -54,15 +54,3 @@ repos:
     -   id: check-algo-readme
     -   id: check-copyright
         args: [ "mmrazor", "tests", "tools"]
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v0.812
-    hooks:
-      - id: mypy
-        exclude: |-
-          (?x)(
-              ^test
-              | ^docs
-              | ^configs
-              | ^.*/configs*
-              | ^projects
-          )
