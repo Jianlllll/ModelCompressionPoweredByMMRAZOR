@@ -39,11 +39,6 @@ repos:
           - mdformat-gfm
           - mdformat_frontmatter
           - linkify-it-py
-  - repo: https://github.com/myint/docformatter
-    rev: v1.3.1
-    hooks:
-      - id: docformatter
-        args: ["--in-place", "--wrap-descriptions", "79"]
   - repo: https://github.com/executablebooks/mdformat
     rev: 0.7.9
     hooks:
